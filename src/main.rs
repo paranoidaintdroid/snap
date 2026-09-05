@@ -57,15 +57,26 @@ fn main() {
         .nth(1)
         .expect("Use the following syntax: snap <measurement-file>");
     let file = File::open(&path).expect("Failed to open the file");
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut stations: HashMap<String, Stats> = HashMap::new();
 
-    for line_r in reader.lines() {
-        let line = line_r.expect("Error reading a line");
+    let mut line = String::new();
 
-        let (station, temperature_raw) =
-            line.split_once(';').expect("Failed to extract measurement");
+    loop {
+        line.clear();
+
+        let bytes_read = reader.read_line(&mut line).expect("Error reading a line");
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        let measurement = line.strip_suffix('\n').unwrap_or(&line);
+
+        let (station, temperature_raw) = measurement
+            .split_once(';')
+            .expect("Failed to extract measurement");
 
         let temperature = parse_temperature(temperature_raw);
 
