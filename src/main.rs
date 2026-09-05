@@ -12,6 +12,24 @@ struct Stats {
     count: i64,
 }
 
+impl Stats {
+    fn new(temperature: i32) -> Self {
+        Self {
+            min: temperature,
+            max: temperature,
+            sum: i64::from(temperature),
+            count: 1,
+        }
+    }
+
+    fn add_measurement(&mut self, temperature: i32) {
+        self.min = self.min.min(temperature);
+        self.max = self.max.max(temperature);
+        self.sum += i64::from(temperature);
+        self.count += 1;
+    }
+}
+
 fn parse_temperature(raw: &str) -> i32 {
     let mut value = 0;
     let mut is_negative = false;
@@ -45,35 +63,18 @@ fn main() {
 
     for line_r in reader.lines() {
         let line = line_r.expect("Error reading a line");
-        //println!("{line}");
 
         let (station, temperature_raw) =
             line.split_once(';').expect("Failed to extract measurement");
 
         let temperature = parse_temperature(temperature_raw);
 
-        //println!("station={station:?}, temperature={temperature}");
-
-        let stats = stations.entry(station.to_owned()).or_insert(Stats {
-            min: i32::MAX,
-            max: i32::MIN,
-            sum: 0,
-            count: 0,
-        });
-
-        stats.min = stats.min.min(temperature);
-        stats.max = stats.max.max(temperature);
-        stats.sum += i64::from(temperature);
-        stats.count += 1;
+        if let Some(stats) = stations.get_mut(station) {
+            stats.add_measurement(temperature);
+        } else {
+            stations.insert(station.to_owned(), Stats::new(temperature));
+        }
     }
-
-    // for (station, stats) in &stations {
-    //         let mean = stats.sum / stats.count as f64;
-    //         println!(
-    //             "{station}: min={}, mean={}, max={}, count={}, sum={}",
-    //             stats.min, mean, stats.max, stats.count, stats.sum
-    //         );
-    //     }
 
     let mut results: Vec<_> = stations.iter().collect();
 
@@ -122,5 +123,18 @@ mod tests {
         assert_eq!(rounded_mean(3, 2), 2);
         assert_eq!(rounded_mean(-3, 2), -1);
         assert_eq!(rounded_mean(28, 2), 14);
+    }
+
+    #[test]
+    fn accumulates_station_statistics() {
+        let mut stats = Stats::new(120);
+
+        stats.add_measurement(340);
+        stats.add_measurement(-40);
+
+        assert_eq!(stats.min, -40);
+        assert_eq!(stats.max, 340);
+        assert_eq!(stats.sum, 420);
+        assert_eq!(stats.count, 3);
     }
 }
