@@ -61,18 +61,28 @@ fn main() {
 
     let mut stations: HashMap<String, Stats> = HashMap::new();
 
-    let mut line = String::new();
+    let mut line = Vec::new();
 
     loop {
         line.clear();
 
-        let bytes_read = reader.read_line(&mut line).expect("Error reading a line");
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .expect("Error reading a line");
 
         if bytes_read == 0 {
             break;
         }
 
-        let measurement = line.strip_suffix('\n').unwrap_or(&line);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+
+        debug_assert!(std::str::from_utf8(&line).is_ok());
+
+        // SAFETY: The official 1BRC input is guaranteed to contain valid UTF-8.
+        // The Python generator writes UTF-8 station names and ASCII measurements.
+        let measurement = unsafe { std::str::from_utf8_unchecked(&line) };
 
         let (station, temperature_raw) = measurement
             .split_once(';')
