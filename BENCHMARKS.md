@@ -10,6 +10,7 @@ Dataset: 1,000,000,000 rows, approximately 15 GB.
 | v3 | Reused one `String` buffer with `read_line` | 193.22 s | 5.18 M rows/s | 193.22 ns | 3.40 MiB |
 | v4 | Reused byte buffer; skipped repeated UTF-8 validation for trusted input | 184.09 s | 5.43 M rows/s | 184.09 ns | 3.45 MiB |
 | v5 | Word-at-a-time deterministic station-name hasher | 155.73 s avg | 6.42 M rows/s | 155.73 ns | 3.36 MiB |
+| v6 | Derived separator position from fixed-width temperature suffix | 143.56 s | 6.97 M rows/s | 143.56 ns | 3.30 MiB |
 
 > v0 was not fully correct: floating-point formatting emitted
 > negative zero and rounded the exact mean -0.15°C for İliç to -0.2°C.

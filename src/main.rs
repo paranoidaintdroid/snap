@@ -48,7 +48,7 @@ impl Hasher for FastHasher {
     }
 }
 
-type StationMap = HashMap<String, Stats, BuildHasherDefault<FastHasher>>;
+type StationMap = HashMap<Vec<u8>, Stats, BuildHasherDefault<FastHasher>>;
 
 struct Stats {
     min: i32,
@@ -75,11 +75,11 @@ impl Stats {
     }
 }
 
-fn parse_temperature(raw: &str) -> i32 {
+fn parse_temperature(raw: &[u8]) -> i32 {
     let mut value = 0;
     let mut is_negative = false;
 
-    for &byte in raw.as_bytes() {
+    for &byte in raw {
         match byte {
             b'-' => is_negative = true,
             b'.' => {}
@@ -95,6 +95,20 @@ fn parse_temperature(raw: &str) -> i32 {
 
 fn rounded_mean(sum: i64, count: i64) -> i64 {
     (2 * sum + count).div_euclid(2 * count)
+}
+
+#[inline]
+fn find_separator(line: &[u8]) -> usize {
+    let length = line.len();
+
+    if line[length - 4] == b';' {
+        length - 4
+    } else if line[length - 5] == b';' {
+        length - 5
+    } else {
+        debug_assert_eq!(line[length - 6], b';');
+        length - 6
+    }
 }
 
 fn main() {
@@ -123,22 +137,15 @@ fn main() {
             line.pop();
         }
 
-        debug_assert!(std::str::from_utf8(&line).is_ok());
-
-        // SAFETY: The official 1BRC input is guaranteed to contain valid UTF-8.
-        // The Python generator writes UTF-8 station names and ASCII measurements.
-        let measurement = unsafe { std::str::from_utf8_unchecked(&line) };
-
-        let (station, temperature_raw) = measurement
-            .split_once(';')
-            .expect("Failed to extract measurement");
-
+        let separator = find_separator(&line);
+        let station = &line[..separator];
+        let temperature_raw = &line[separator + 1..];
         let temperature = parse_temperature(temperature_raw);
 
         if let Some(stats) = stations.get_mut(station) {
             stats.add_measurement(temperature);
         } else {
-            stations.insert(station.to_owned(), Stats::new(temperature));
+            stations.insert(station.to_vec(), Stats::new(temperature));
         }
     }
 
@@ -154,10 +161,12 @@ fn main() {
         }
 
         let mean = rounded_mean(stats.sum, stats.count);
+        let station_name =
+            std::str::from_utf8(station.as_slice()).expect("Invalid UTF-8 station name");
 
         print!(
             "{}={:.1}/{:.1}/{:.1}",
-            station,
+            station_name,
             f64::from(stats.min) / 10.0,
             mean as f64 / 10.0,
             f64::from(stats.max) / 10.0,
@@ -173,13 +182,13 @@ mod tests {
 
     #[test]
     fn parses_temperatures_as_integer_tenths() {
-        assert_eq!(parse_temperature("0.0"), 0);
-        assert_eq!(parse_temperature("9.9"), 99);
-        assert_eq!(parse_temperature("12.3"), 123);
-        assert_eq!(parse_temperature("-0.7"), -7);
-        assert_eq!(parse_temperature("-12.3"), -123);
-        assert_eq!(parse_temperature("99.9"), 999);
-        assert_eq!(parse_temperature("-99.9"), -999);
+        assert_eq!(parse_temperature(b"0.0"), 0);
+        assert_eq!(parse_temperature(b"9.9"), 99);
+        assert_eq!(parse_temperature(b"12.3"), 123);
+        assert_eq!(parse_temperature(b"-0.7"), -7);
+        assert_eq!(parse_temperature(b"-12.3"), -123);
+        assert_eq!(parse_temperature(b"99.9"), 999);
+        assert_eq!(parse_temperature(b"-99.9"), -999);
     }
 
     #[test]
@@ -202,5 +211,13 @@ mod tests {
         assert_eq!(stats.max, 340);
         assert_eq!(stats.sum, 420);
         assert_eq!(stats.count, 3);
+    }
+
+    #[test]
+    fn finds_separator_from_temperature_length() {
+        assert_eq!(find_separator(b"A;1.2"), 1);
+        assert_eq!(find_separator(b"A;12.3"), 1);
+        assert_eq!(find_separator(b"A;-1.2"), 1);
+        assert_eq!(find_separator(b"A;-12.3"), 1);
     }
 }
