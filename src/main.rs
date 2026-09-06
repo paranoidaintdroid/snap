@@ -2,8 +2,53 @@ use std::{
     collections::HashMap,
     env,
     fs::File,
+    hash::{BuildHasherDefault, Hasher},
     io::{BufRead, BufReader},
 };
+
+const HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+
+#[derive(Default)]
+struct FastHasher {
+    hash: u64,
+}
+
+impl FastHasher {
+    #[inline]
+    fn add_word(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(HASH_MULTIPLIER);
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+
+        for chunk in &mut chunks {
+            let word =
+                u64::from_ne_bytes(chunk.try_into().expect("chunk must contain eight bytes"));
+            self.add_word(word);
+        }
+
+        let remainder = chunks.remainder();
+        let mut tail = 0_u64;
+
+        for (index, &byte) in remainder.iter().enumerate() {
+            tail |= u64::from(byte) << (index * 8);
+        }
+
+        tail ^= (bytes.len() as u64).wrapping_mul(HASH_MULTIPLIER);
+        self.add_word(tail);
+    }
+}
+
+type StationMap = HashMap<String, Stats, BuildHasherDefault<FastHasher>>;
 
 struct Stats {
     min: i32,
@@ -59,7 +104,7 @@ fn main() {
     let file = File::open(&path).expect("Failed to open the file");
     let mut reader = BufReader::new(file);
 
-    let mut stations: HashMap<String, Stats> = HashMap::new();
+    let mut stations = StationMap::default();
 
     let mut line = Vec::new();
 
