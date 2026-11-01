@@ -3,6 +3,7 @@ use std::{
     env,
     fs::File,
     hash::{BuildHasherDefault, Hasher},
+    thread,
 };
 
 use memmap2::Mmap;
@@ -49,7 +50,7 @@ impl Hasher for FastHasher {
     }
 }
 
-type StationMap = HashMap<Vec<u8>, Stats, BuildHasherDefault<FastHasher>>;
+type StationMap<'a> = HashMap<&'a [u8], Stats, BuildHasherDefault<FastHasher>>;
 
 struct Stats {
     min: i32,
@@ -73,6 +74,13 @@ impl Stats {
         self.max = self.max.max(temperature);
         self.sum += i64::from(temperature);
         self.count += 1;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
     }
 }
 
@@ -112,26 +120,55 @@ fn find_separator(line: &[u8]) -> usize {
     }
 }
 
-fn main() {
-    let path = env::args()
-        .nth(1)
-        .expect("Use the following syntax: snap <measurement-file>");
-    let file = File::open(&path).expect("Failed to open the file");
-    let mmap = unsafe { Mmap::map(&file).expect("Failed to map the file") };
-    let data: &[u8] = &mmap;
+fn split_into_chunks(data: &[u8], chunk_count: usize) -> Vec<&[u8]> {
+    if data.is_empty() {
+        return Vec::new();
+    }
 
-    let mut stations = StationMap::default();
-
+    let chunk_count = chunk_count.max(1);
+    let target_size = (data.len() / chunk_count).max(1);
+    let mut chunks = Vec::with_capacity(chunk_count);
     let mut start = 0;
 
-    while start < data.len() {
-        let end = match data[start..].iter().position(|&byte| byte == b'\n') {
-            Some(offset) => start + offset,
+    for index in 0..chunk_count {
+        if start >= data.len() {
+            break;
+        }
+
+        if index + 1 == chunk_count {
+            chunks.push(&data[start..]);
+            break;
+        }
+
+        let tentative_end = (start + target_size).min(data.len());
+        let end = match data[tentative_end..].iter().position(|&byte| byte == b'\n') {
+            Some(offset) => tentative_end + offset + 1,
             None => data.len(),
         };
 
-        let line = &data[start..end];
+        chunks.push(&data[start..end]);
+        start = end;
+    }
+
+    chunks
+}
+
+fn process_chunk(chunk: &[u8]) -> StationMap<'_> {
+    let mut stations = StationMap::default();
+    let mut start = 0;
+
+    while start < chunk.len() {
+        let end = match chunk[start..].iter().position(|&byte| byte == b'\n') {
+            Some(offset) => start + offset,
+            None => chunk.len(),
+        };
+
+        let line = &chunk[start..end];
         start = end + 1;
+
+        if line.is_empty() {
+            continue;
+        }
 
         let separator = find_separator(line);
         let station = &line[..separator];
@@ -141,11 +178,50 @@ fn main() {
         if let Some(stats) = stations.get_mut(station) {
             stats.add_measurement(temperature);
         } else {
-            stations.insert(station.to_vec(), Stats::new(temperature));
+            stations.insert(station, Stats::new(temperature));
         }
     }
 
-    let mut results: Vec<_> = stations.iter().collect();
+    stations
+}
+
+fn main() {
+    let path = env::args()
+        .nth(1)
+        .expect("Use the following syntax: snap <measurement-file>");
+    let file = File::open(&path).expect("Failed to open the file");
+    let mmap = unsafe { Mmap::map(&file).expect("Failed to map the file") };
+    let data: &[u8] = &mmap;
+
+    let thread_count = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    let chunks = split_into_chunks(data, thread_count);
+
+    let mut stations = thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| scope.spawn(move || process_chunk(chunk)))
+            .collect();
+
+        let mut merged = StationMap::default();
+
+        for handle in handles {
+            let local_map = handle.join().expect("Worker thread panicked");
+
+            for (station, stats) in local_map {
+                if let Some(existing) = merged.get_mut(station) {
+                    existing.merge(&stats);
+                } else {
+                    merged.insert(station, stats);
+                }
+            }
+        }
+
+        merged
+    });
+
+    let mut results: Vec<_> = stations.drain().collect();
 
     results.sort_unstable_by_key(|(name_a, _)| *name_a);
 
@@ -157,8 +233,7 @@ fn main() {
         }
 
         let mean = rounded_mean(stats.sum, stats.count);
-        let station_name =
-            std::str::from_utf8(station.as_slice()).expect("Invalid UTF-8 station name");
+        let station_name = std::str::from_utf8(station).expect("Invalid UTF-8 station name");
 
         print!(
             "{}={:.1}/{:.1}/{:.1}",
@@ -215,5 +290,19 @@ mod tests {
         assert_eq!(find_separator(b"A;12.3"), 1);
         assert_eq!(find_separator(b"A;-1.2"), 1);
         assert_eq!(find_separator(b"A;-12.3"), 1);
+    }
+
+    #[test]
+    fn splits_chunks_along_newline_boundaries() {
+        let data = b"Alpha;1.0\nBeta;2.0\nGamma;3.0\nDelta;4.0\n";
+        let chunks = split_into_chunks(data, 3);
+
+        let rejoined: Vec<u8> = chunks.iter().copied().flatten().copied().collect();
+        assert_eq!(rejoined, data);
+
+        for chunk in chunks {
+            assert!(!chunk.is_empty());
+            assert_eq!(chunk.last(), Some(&b'\n'));
+        }
     }
 }
