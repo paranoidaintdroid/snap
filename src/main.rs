@@ -84,40 +84,57 @@ impl Stats {
     }
 }
 
-fn parse_temperature(raw: &[u8]) -> i32 {
-    let mut value = 0;
-    let mut is_negative = false;
+#[inline]
+fn parse_temperature_and_advance(raw: &[u8]) -> (i32, usize) {
+    let (sign, offset) = if raw[0] == b'-' { (-1, 1) } else { (1, 0) };
 
-    for &byte in raw {
-        match byte {
-            b'-' => is_negative = true,
-            b'.' => {}
-            b'0'..=b'9' => {
-                value = value * 10 + i32::from(byte - b'0');
-            }
-            _ => unreachable!("invalid temperature"),
+    if raw[offset + 1] == b'.' {
+        let tenths = i32::from(raw[offset] - b'0') * 10 + i32::from(raw[offset + 2] - b'0');
+        (sign * tenths, offset + 4)
+    } else {
+        let tenths = i32::from(raw[offset] - b'0') * 100
+            + i32::from(raw[offset + 1] - b'0') * 10
+            + i32::from(raw[offset + 3] - b'0');
+        (sign * tenths, offset + 5)
+    }
+}
+
+#[inline]
+fn find_semicolon(bytes: &[u8]) -> usize {
+    const SEMICOLON_MASK: u64 = 0x3b3b_3b3b_3b3b_3b3b;
+    const LO_BYTES: u64 = 0x0101_0101_0101_0101;
+    const HI_BYTES: u64 = 0x8080_8080_8080_8080;
+
+    let mut offset = 0;
+
+    while offset + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("slice has eight bytes"),
+        );
+        let xored = word ^ SEMICOLON_MASK;
+        let matches = xored.wrapping_sub(LO_BYTES) & !xored & HI_BYTES;
+
+        if matches != 0 {
+            return offset + (matches.trailing_zeros() as usize >> 3);
         }
+
+        offset += 8;
     }
 
-    if is_negative { -value } else { value }
+    while offset < bytes.len() {
+        if bytes[offset] == b';' {
+            return offset;
+        }
+        offset += 1;
+    }
+
+    unreachable!("missing semicolon separator")
 }
 
 fn rounded_mean(sum: i64, count: i64) -> i64 {
     (2 * sum + count).div_euclid(2 * count)
-}
-
-#[inline]
-fn find_separator(line: &[u8]) -> usize {
-    let length = line.len();
-
-    if line[length - 4] == b';' {
-        length - 4
-    } else if line[length - 5] == b';' {
-        length - 5
-    } else {
-        debug_assert_eq!(line[length - 6], b';');
-        length - 6
-    }
 }
 
 fn split_into_chunks(data: &[u8], chunk_count: usize) -> Vec<&[u8]> {
@@ -155,25 +172,14 @@ fn split_into_chunks(data: &[u8], chunk_count: usize) -> Vec<&[u8]> {
 
 fn process_chunk(chunk: &[u8]) -> StationMap<'_> {
     let mut stations = StationMap::default();
-    let mut start = 0;
+    let mut cursor = 0;
 
-    while start < chunk.len() {
-        let end = match chunk[start..].iter().position(|&byte| byte == b'\n') {
-            Some(offset) => start + offset,
-            None => chunk.len(),
-        };
-
-        let line = &chunk[start..end];
-        start = end + 1;
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let separator = find_separator(line);
-        let station = &line[..separator];
-        let temperature_raw = &line[separator + 1..];
-        let temperature = parse_temperature(temperature_raw);
+    while cursor < chunk.len() {
+        let remaining = &chunk[cursor..];
+        let separator = find_semicolon(remaining);
+        let station = &remaining[..separator];
+        let (temperature, consumed) = parse_temperature_and_advance(&remaining[separator + 1..]);
+        cursor += separator + 1 + consumed;
 
         if let Some(stats) = stations.get_mut(station) {
             stats.add_measurement(temperature);
@@ -253,13 +259,13 @@ mod tests {
 
     #[test]
     fn parses_temperatures_as_integer_tenths() {
-        assert_eq!(parse_temperature(b"0.0"), 0);
-        assert_eq!(parse_temperature(b"9.9"), 99);
-        assert_eq!(parse_temperature(b"12.3"), 123);
-        assert_eq!(parse_temperature(b"-0.7"), -7);
-        assert_eq!(parse_temperature(b"-12.3"), -123);
-        assert_eq!(parse_temperature(b"99.9"), 999);
-        assert_eq!(parse_temperature(b"-99.9"), -999);
+        assert_eq!(parse_temperature_and_advance(b"0.0\n"), (0, 4));
+        assert_eq!(parse_temperature_and_advance(b"9.9\n"), (99, 4));
+        assert_eq!(parse_temperature_and_advance(b"12.3\n"), (123, 5));
+        assert_eq!(parse_temperature_and_advance(b"-0.7\n"), (-7, 5));
+        assert_eq!(parse_temperature_and_advance(b"-12.3\n"), (-123, 6));
+        assert_eq!(parse_temperature_and_advance(b"99.9\n"), (999, 5));
+        assert_eq!(parse_temperature_and_advance(b"-99.9\n"), (-999, 6));
     }
 
     #[test]
@@ -285,11 +291,11 @@ mod tests {
     }
 
     #[test]
-    fn finds_separator_from_temperature_length() {
-        assert_eq!(find_separator(b"A;1.2"), 1);
-        assert_eq!(find_separator(b"A;12.3"), 1);
-        assert_eq!(find_separator(b"A;-1.2"), 1);
-        assert_eq!(find_separator(b"A;-12.3"), 1);
+    fn finds_semicolon_across_short_and_long_names() {
+        assert_eq!(find_semicolon(b"A;1.2\n"), 1);
+        assert_eq!(find_semicolon(b"Hamburg;12.3\n"), 7);
+        assert_eq!(find_semicolon(b"Dar es Salaam;26.1\n"), 13);
+        assert_eq!(find_semicolon(b"Petropavlovsk-Kamchatsky;-4.8\n"), 24);
     }
 
     #[test]
