@@ -3,8 +3,9 @@ use std::{
     env,
     fs::File,
     hash::{BuildHasherDefault, Hasher},
-    io::{BufRead, BufReader},
 };
+
+use memmap2::Mmap;
 
 const HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
 
@@ -116,28 +117,23 @@ fn main() {
         .nth(1)
         .expect("Use the following syntax: snap <measurement-file>");
     let file = File::open(&path).expect("Failed to open the file");
-    let mut reader = BufReader::new(file);
+    let mmap = unsafe { Mmap::map(&file).expect("Failed to map the file") };
+    let data: &[u8] = &mmap;
 
     let mut stations = StationMap::default();
 
-    let mut line = Vec::new();
+    let mut start = 0;
 
-    loop {
-        line.clear();
+    while start < data.len() {
+        let end = match data[start..].iter().position(|&byte| byte == b'\n') {
+            Some(offset) => start + offset,
+            None => data.len(),
+        };
 
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
-            .expect("Error reading a line");
+        let line = &data[start..end];
+        start = end + 1;
 
-        if bytes_read == 0 {
-            break;
-        }
-
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-
-        let separator = find_separator(&line);
+        let separator = find_separator(line);
         let station = &line[..separator];
         let temperature_raw = &line[separator + 1..];
         let temperature = parse_temperature(temperature_raw);

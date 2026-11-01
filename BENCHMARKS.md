@@ -23,3 +23,4 @@ Dataset: 1,000,000,000 rows, approximately 15 GB.
 - Rejected direct indexed temperature parser: 194.33–220.03 s.
 - On the cached 50M-row profiling dataset, the UTF-8 fast path reduced time from 11.65 s to 9.37 s.
 - v5 full-dataset runs: 159.33 s and 152.12 s; the table reports their 155.73 s mean.
+- On the 50M-row profiling dataset, memory-mapping the input and scanning for newlines directly reduced time from 7.67–8.85 s (two runs) to 5.11–5.85 s (three runs), single-threaded, output identical. Measured once per build, not a controlled benchmark.
