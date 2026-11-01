@@ -13,6 +13,7 @@ Dataset: 1,000,000,000 rows, approximately 15 GB.
 | v6 | Derived separator position from fixed-width temperature suffix | 143.56 s | 6.97 M rows/s | 143.56 ns | 3.30 MiB |
 | v7 | Memory-mapped input split across threads with borrowed station keys | 78.74 s | 12.70 M rows/s | 78.74 ns | 5.35 GiB |
 | v8 | SWAR semicolon search with direct temperature-and-newline advance | 23.30 s avg | 42.92 M rows/s | 23.30 ns | 5.17 GiB |
+| v9 | Fused SWAR semicolon + hash with compact `u16` bucket index table | 17.42 s avg | 57.41 M rows/s | 17.42 ns | 5.67 GiB |
 
 > v0 was not fully correct: floating-point formatting emitted
 > negative zero and rounded the exact mean -0.15°C for İliç to -0.2°C.
@@ -29,3 +30,6 @@ Dataset: 1,000,000,000 rows, approximately 15 GB.
 - Adding thread-scoped chunk processing on the 50M-row dataset reduced time to 3.24 s (first run) and 1.54–1.66 s (subsequent cached runs).
 - On the full 1B-row dataset (15.9 GB on a 7.4 GiB RAM VM), v7 took 78.74 s wall time (471.35 s user, 369.30 s sys) and 5.35 GiB peak RSS due to page-fault and page-reclaim overhead across the full-file mapping.
 - v8 eliminated the separate newline scan by finding `;` 8 bytes at a time (SWAR) and jumping across the fixed-format temperature suffix directly to the next line. On the 50M-row dataset, cached runs dropped to 1.03–1.19 s; on the full 1B-row dataset, two runs completed in 22.50 s and 24.09 s (mean 23.30 s; ~227 s user, ~27.9 s sys).
+- Rejected flat 32,768-slot `Slot` table indexed by unmixed low hash bits (`hash & 0x7fff`): 1.63–1.90 s on the 50M-row dataset (worse than `HashMap` at 1.03–1.19 s due to poor low-bit avalanche from multiplicative hashing and 1.31 MB per-thread table footprint).
+- Folding upper hash bits (`hash ^ (hash >> 32)`) on the flat `Slot` table brought 50M-row runs down to 1.14–1.15 s (65,536 slots) and 0.96–1.07 s (32,768 slots).
+- v9 replaced the flat `Slot` array with a 64 KB `u16` index array (`[u16; 32768]`) pointing into a dense `Vec<Slot>`, shrinking the probe structure into L1/L2 cache. Cached 50M-row runs dropped to 0.72–0.80 s, and two full 1B-row runs completed in 18.59 s and 16.25 s (mean 17.42 s; 166.98–177.85 s user, 16.35–28.82 s sys).

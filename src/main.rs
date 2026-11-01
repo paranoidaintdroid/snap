@@ -1,111 +1,165 @@
-use std::{
-    collections::HashMap,
-    env,
-    fs::File,
-    hash::{BuildHasherDefault, Hasher},
-    thread,
-};
+use std::{env, fs::File, thread};
 
 use memmap2::Mmap;
 
 const HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+const TABLE_SHIFT: u32 = 15;
+const TABLE_CAPACITY: usize = 1 << TABLE_SHIFT;
+const TABLE_MASK: usize = TABLE_CAPACITY - 1;
+const EMPTY_BUCKET: u16 = u16::MAX;
 
-#[derive(Default)]
-struct FastHasher {
-    hash: u64,
+#[inline]
+fn mix_hash_word(hash: u64, word: u64) -> u64 {
+    (hash.rotate_left(5) ^ word).wrapping_mul(HASH_MULTIPLIER)
 }
 
-impl FastHasher {
-    #[inline]
-    fn add_word(&mut self, word: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(HASH_MULTIPLIER);
-    }
+#[inline]
+fn slot_index(hash: u64) -> usize {
+    ((hash ^ (hash >> 32)) as usize) & TABLE_MASK
 }
 
-impl Hasher for FastHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-
-        for chunk in &mut chunks {
-            let word =
-                u64::from_ne_bytes(chunk.try_into().expect("chunk must contain eight bytes"));
-            self.add_word(word);
-        }
-
-        let remainder = chunks.remainder();
-        let mut tail = 0_u64;
-
-        for (index, &byte) in remainder.iter().enumerate() {
-            tail |= u64::from(byte) << (index * 8);
-        }
-
-        tail ^= (bytes.len() as u64).wrapping_mul(HASH_MULTIPLIER);
-        self.add_word(tail);
-    }
-}
-
-type StationMap<'a> = HashMap<&'a [u8], Stats, BuildHasherDefault<FastHasher>>;
-
+#[derive(Clone, Copy)]
 struct Stats {
-    min: i32,
-    max: i32,
+    min: i16,
+    max: i16,
+    count: u32,
     sum: i64,
-    count: i64,
 }
 
 impl Stats {
-    fn new(temperature: i32) -> Self {
+    #[inline]
+    fn new(temperature: i16) -> Self {
         Self {
             min: temperature,
             max: temperature,
-            sum: i64::from(temperature),
             count: 1,
+            sum: i64::from(temperature),
         }
     }
 
-    fn add_measurement(&mut self, temperature: i32) {
+    #[inline]
+    fn add_measurement(&mut self, temperature: i16) {
         self.min = self.min.min(temperature);
         self.max = self.max.max(temperature);
-        self.sum += i64::from(temperature);
         self.count += 1;
+        self.sum += i64::from(temperature);
     }
 
+    #[inline]
     fn merge(&mut self, other: &Self) {
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
-        self.sum += other.sum;
         self.count += other.count;
+        self.sum += other.sum;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Slot<'a> {
+    hash: u64,
+    station: &'a [u8],
+    stats: Stats,
+}
+
+struct StationTable<'a> {
+    buckets: Box<[u16]>,
+    entries: Vec<Slot<'a>>,
+}
+
+impl<'a> StationTable<'a> {
+    fn new() -> Self {
+        Self {
+            buckets: vec![EMPTY_BUCKET; TABLE_CAPACITY].into_boxed_slice(),
+            entries: Vec::with_capacity(10_000),
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, station: &'a [u8], hash: u64, temperature: i16) {
+        let mut index = slot_index(hash);
+
+        loop {
+            let bucket = self.buckets[index];
+
+            if bucket == EMPTY_BUCKET {
+                let entry_index = self.entries.len() as u16;
+                self.buckets[index] = entry_index;
+                self.entries.push(Slot {
+                    hash,
+                    station,
+                    stats: Stats::new(temperature),
+                });
+                return;
+            }
+
+            let slot = &mut self.entries[bucket as usize];
+
+            if slot.hash == hash && slot.station == station {
+                slot.stats.add_measurement(temperature);
+                return;
+            }
+
+            index = (index + 1) & TABLE_MASK;
+        }
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        for incoming in &other.entries {
+            let mut index = slot_index(incoming.hash);
+
+            loop {
+                let bucket = self.buckets[index];
+
+                if bucket == EMPTY_BUCKET {
+                    let entry_index = self.entries.len() as u16;
+                    self.buckets[index] = entry_index;
+                    self.entries.push(*incoming);
+                    break;
+                }
+
+                let slot = &mut self.entries[bucket as usize];
+
+                if slot.hash == incoming.hash && slot.station == incoming.station {
+                    slot.stats.merge(&incoming.stats);
+                    break;
+                }
+
+                index = (index + 1) & TABLE_MASK;
+            }
+        }
+    }
+
+    fn into_entries(self) -> Vec<(&'a [u8], Stats)> {
+        self.entries
+            .into_iter()
+            .map(|slot| (slot.station, slot.stats))
+            .collect()
     }
 }
 
 #[inline]
-fn parse_temperature_and_advance(raw: &[u8]) -> (i32, usize) {
+fn parse_temperature_and_advance(raw: &[u8]) -> (i16, usize) {
     let (sign, offset) = if raw[0] == b'-' { (-1, 1) } else { (1, 0) };
 
     if raw[offset + 1] == b'.' {
-        let tenths = i32::from(raw[offset] - b'0') * 10 + i32::from(raw[offset + 2] - b'0');
+        let tenths = i16::from(raw[offset] - b'0') * 10 + i16::from(raw[offset + 2] - b'0');
         (sign * tenths, offset + 4)
     } else {
-        let tenths = i32::from(raw[offset] - b'0') * 100
-            + i32::from(raw[offset + 1] - b'0') * 10
-            + i32::from(raw[offset + 3] - b'0');
+        let tenths = i16::from(raw[offset] - b'0') * 100
+            + i16::from(raw[offset + 1] - b'0') * 10
+            + i16::from(raw[offset + 3] - b'0');
         (sign * tenths, offset + 5)
     }
 }
 
 #[inline]
-fn find_semicolon(bytes: &[u8]) -> usize {
+fn find_semicolon_and_hash(bytes: &[u8]) -> (usize, u64) {
     const SEMICOLON_MASK: u64 = 0x3b3b_3b3b_3b3b_3b3b;
     const LO_BYTES: u64 = 0x0101_0101_0101_0101;
     const HI_BYTES: u64 = 0x8080_8080_8080_8080;
 
     let mut offset = 0;
+    let mut hash = 0_u64;
 
     while offset + 8 <= bytes.len() {
         let word = u64::from_le_bytes(
@@ -117,16 +171,30 @@ fn find_semicolon(bytes: &[u8]) -> usize {
         let matches = xored.wrapping_sub(LO_BYTES) & !xored & HI_BYTES;
 
         if matches != 0 {
-            return offset + (matches.trailing_zeros() as usize >> 3);
+            let byte_index = (matches.trailing_zeros() >> 3) as usize;
+            let separator = offset + byte_index;
+            let mask = (1_u64 << (byte_index * 8)) - 1;
+            let tail = (word & mask) ^ (separator as u64).wrapping_mul(HASH_MULTIPLIER);
+            hash = mix_hash_word(hash, tail);
+            return (separator, hash);
         }
 
+        hash = mix_hash_word(hash, word);
         offset += 8;
     }
 
+    let mut tail = 0_u64;
+    let mut tail_index = 0;
+
     while offset < bytes.len() {
-        if bytes[offset] == b';' {
-            return offset;
+        let byte = bytes[offset];
+        if byte == b';' {
+            let tail_word = tail ^ (offset as u64).wrapping_mul(HASH_MULTIPLIER);
+            hash = mix_hash_word(hash, tail_word);
+            return (offset, hash);
         }
+        tail |= u64::from(byte) << (tail_index * 8);
+        tail_index += 1;
         offset += 1;
     }
 
@@ -170,22 +238,18 @@ fn split_into_chunks(data: &[u8], chunk_count: usize) -> Vec<&[u8]> {
     chunks
 }
 
-fn process_chunk(chunk: &[u8]) -> StationMap<'_> {
-    let mut stations = StationMap::default();
+fn process_chunk(chunk: &[u8]) -> StationTable<'_> {
+    let mut stations = StationTable::new();
     let mut cursor = 0;
 
     while cursor < chunk.len() {
         let remaining = &chunk[cursor..];
-        let separator = find_semicolon(remaining);
+        let (separator, hash) = find_semicolon_and_hash(remaining);
         let station = &remaining[..separator];
         let (temperature, consumed) = parse_temperature_and_advance(&remaining[separator + 1..]);
         cursor += separator + 1 + consumed;
 
-        if let Some(stats) = stations.get_mut(station) {
-            stats.add_measurement(temperature);
-        } else {
-            stations.insert(station, Stats::new(temperature));
-        }
+        stations.record(station, hash, temperature);
     }
 
     stations
@@ -204,30 +268,28 @@ fn main() {
         .unwrap_or(1);
     let chunks = split_into_chunks(data, thread_count);
 
-    let mut stations = thread::scope(|scope| {
+    let stations = thread::scope(|scope| {
         let handles: Vec<_> = chunks
             .into_iter()
             .map(|chunk| scope.spawn(move || process_chunk(chunk)))
             .collect();
 
-        let mut merged = StationMap::default();
+        let mut merged: Option<StationTable<'_>> = None;
 
         for handle in handles {
-            let local_map = handle.join().expect("Worker thread panicked");
+            let local_table = handle.join().expect("Worker thread panicked");
 
-            for (station, stats) in local_map {
-                if let Some(existing) = merged.get_mut(station) {
-                    existing.merge(&stats);
-                } else {
-                    merged.insert(station, stats);
-                }
+            if let Some(existing) = &mut merged {
+                existing.merge_from(&local_table);
+            } else {
+                merged = Some(local_table);
             }
         }
 
-        merged
+        merged.unwrap_or_else(StationTable::new)
     });
 
-    let mut results: Vec<_> = stations.drain().collect();
+    let mut results = stations.into_entries();
 
     results.sort_unstable_by_key(|(name_a, _)| *name_a);
 
@@ -238,7 +300,7 @@ fn main() {
             print!(", ");
         }
 
-        let mean = rounded_mean(stats.sum, stats.count);
+        let mean = rounded_mean(stats.sum, i64::from(stats.count));
         let station_name = std::str::from_utf8(station).expect("Invalid UTF-8 station name");
 
         print!(
@@ -291,11 +353,18 @@ mod tests {
     }
 
     #[test]
-    fn finds_semicolon_across_short_and_long_names() {
-        assert_eq!(find_semicolon(b"A;1.2\n"), 1);
-        assert_eq!(find_semicolon(b"Hamburg;12.3\n"), 7);
-        assert_eq!(find_semicolon(b"Dar es Salaam;26.1\n"), 13);
-        assert_eq!(find_semicolon(b"Petropavlovsk-Kamchatsky;-4.8\n"), 24);
+    fn finds_semicolon_and_matches_hash_across_paths() {
+        assert_eq!(find_semicolon_and_hash(b"A;1.2\n").0, 1);
+        assert_eq!(find_semicolon_and_hash(b"Hamburg;12.3\n").0, 7);
+        assert_eq!(find_semicolon_and_hash(b"Dar es Salaam;26.1\n").0, 13);
+        assert_eq!(
+            find_semicolon_and_hash(b"Petropavlovsk-Kamchatsky;-4.8\n").0,
+            24
+        );
+        assert_eq!(
+            find_semicolon_and_hash(b"A;1.2\n"),
+            find_semicolon_and_hash(b"A;1.2\nB;2.3\n")
+        );
     }
 
     #[test]
