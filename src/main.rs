@@ -94,7 +94,10 @@ impl<'a> StationTable<'a> {
 
             let slot = &mut self.entries[bucket as usize];
 
-            if slot.hash == hash && slot.station == station {
+            if slot.hash == hash
+                && slot.station.len() == station.len()
+                && (station.len() <= 8 || slot.station == station)
+            {
                 slot.stats.add_measurement(temperature);
                 return;
             }
@@ -139,17 +142,18 @@ impl<'a> StationTable<'a> {
 
 #[inline]
 fn parse_temperature_and_advance(raw: &[u8]) -> (i16, usize) {
-    let (sign, offset) = if raw[0] == b'-' { (-1, 1) } else { (1, 0) };
+    let is_neg = usize::from(raw[0] == b'-');
+    let sign = 1 - 2 * (is_neg as i16);
+    let is_two_digits = usize::from(raw[is_neg + 1] != b'.');
 
-    if raw[offset + 1] == b'.' {
-        let tenths = i16::from(raw[offset] - b'0') * 10 + i16::from(raw[offset + 2] - b'0');
-        (sign * tenths, offset + 4)
-    } else {
-        let tenths = i16::from(raw[offset] - b'0') * 100
-            + i16::from(raw[offset + 1] - b'0') * 10
-            + i16::from(raw[offset + 3] - b'0');
-        (sign * tenths, offset + 5)
-    }
+    let hundreds = i16::from(raw[is_neg] - b'0') * (is_two_digits as i16 * 100);
+    let tens = i16::from(raw[is_neg + is_two_digits] - b'0') * 10;
+    let tenths = i16::from(raw[is_neg + 2 + is_two_digits] - b'0');
+
+    let temperature = sign * (hundreds + tens + tenths);
+    let consumed = is_neg + 4 + is_two_digits;
+
+    (temperature, consumed)
 }
 
 #[inline]

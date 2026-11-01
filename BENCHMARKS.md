@@ -14,6 +14,7 @@ Dataset: 1,000,000,000 rows, approximately 15 GB.
 | v7 | Memory-mapped input split across threads with borrowed station keys | 78.74 s | 12.70 M rows/s | 78.74 ns | 5.35 GiB |
 | v8 | SWAR semicolon search with direct temperature-and-newline advance | 23.30 s avg | 42.92 M rows/s | 23.30 ns | 5.17 GiB |
 | v9 | Fused SWAR semicolon + hash with compact `u16` bucket index table | 17.42 s avg | 57.41 M rows/s | 17.42 ns | 5.67 GiB |
+| v10 | Branchless temperature parser + bijective short-key equality | 14.39 s avg | 69.49 M rows/s | 14.39 ns | 5.70 GiB |
 
 > v0 was not fully correct: floating-point formatting emitted
 > negative zero and rounded the exact mean -0.15°C for İliç to -0.2°C.
@@ -33,3 +34,4 @@ Dataset: 1,000,000,000 rows, approximately 15 GB.
 - Rejected flat 32,768-slot `Slot` table indexed by unmixed low hash bits (`hash & 0x7fff`): 1.63–1.90 s on the 50M-row dataset (worse than `HashMap` at 1.03–1.19 s due to poor low-bit avalanche from multiplicative hashing and 1.31 MB per-thread table footprint).
 - Folding upper hash bits (`hash ^ (hash >> 32)`) on the flat `Slot` table brought 50M-row runs down to 1.14–1.15 s (65,536 slots) and 0.96–1.07 s (32,768 slots).
 - v9 replaced the flat `Slot` array with a 64 KB `u16` index array (`[u16; 32768]`) pointing into a dense `Vec<Slot>`, shrinking the probe structure into L1/L2 cache. Cached 50M-row runs dropped to 0.72–0.80 s, and two full 1B-row runs completed in 18.59 s and 16.25 s (mean 17.42 s; 166.98–177.85 s user, 16.35–28.82 s sys).
+- v10 made `parse_temperature_and_advance` branchless and skipped slice byte comparisons for station names `<= 8` bytes (where the 64-bit multiplicative hash is a bijection for a fixed length). Cached 50M-row runs dropped to 0.54–0.58 s. On the full 1B-row dataset, the first pass after 50M profiling took 19.76 s (184.87 s user, 34.38 s sys) and the two subsequent passes completed in 14.11 s (138.81 s user, 19.37 s sys) and 14.66 s (137.74 s user, 23.18 s sys) for a 14.39 s warm mean (16.18 s across all three runs).
